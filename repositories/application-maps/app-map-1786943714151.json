@@ -1,0 +1,54 @@
+{
+  "name": "app-map-1786943714151",
+  "appUrl": "https://www.saucedemo.com",
+  "workflow": [
+    "login"
+  ],
+  "elements": {
+    "username": {
+      "selector": "#user-name",
+      "type": "input",
+      "label": "Username",
+      "isClickable": true
+    },
+    "password": {
+      "selector": "#password",
+      "type": "input",
+      "label": "Password",
+      "isClickable": true
+    },
+    "loginButton": {
+      "selector": "#login-button",
+      "type": "button",
+      "label": "Login",
+      "isClickable": true
+    }
+  },
+  "pages": {
+    "login": {
+      "name": "LoginPage",
+      "url": "https://www.saucedemo.com",
+      "elements": {
+        "username": {
+          "selector": "#user-name",
+          "type": "input",
+          "label": "Username",
+          "isClickable": true
+        },
+        "password": {
+          "selector": "#password",
+          "type": "input",
+          "label": "Password",
+          "isClickable": true
+        },
+        "loginButton": {
+          "selector": "#login-button",
+          "type": "button",
+          "label": "Login",
+          "isClickable": true
+        }
+      }
+    }
+  },
+  "discoveredAt": "2026-08-17T05:15:14.151Z"
+}

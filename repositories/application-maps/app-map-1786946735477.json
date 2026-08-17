@@ -1,0 +1,83 @@
+{
+  "name": "app-map-1786946735477",
+  "appUrl": "https://www.saucedemo.com",
+  "workflow": [
+    "login",
+    "cart"
+  ],
+  "elements": {
+    "username": {
+      "selector": "#user-name",
+      "type": "input",
+      "label": "Username",
+      "isClickable": true
+    },
+    "password": {
+      "selector": "#password",
+      "type": "input",
+      "label": "Password",
+      "isClickable": true
+    },
+    "loginButton": {
+      "selector": "#login-button",
+      "type": "button",
+      "label": "Login",
+      "isClickable": true
+    },
+    "cartList": {
+      "selector": ".cart_list",
+      "type": "div",
+      "label": "Cart Items List"
+    },
+    "checkoutButton": {
+      "selector": ".checkout_button",
+      "type": "button",
+      "label": "Checkout",
+      "isClickable": true
+    }
+  },
+  "pages": {
+    "login": {
+      "name": "LoginPage",
+      "url": "https://www.saucedemo.com",
+      "elements": {
+        "username": {
+          "selector": "#user-name",
+          "type": "input",
+          "label": "Username",
+          "isClickable": true
+        },
+        "password": {
+          "selector": "#password",
+          "type": "input",
+          "label": "Password",
+          "isClickable": true
+        },
+        "loginButton": {
+          "selector": "#login-button",
+          "type": "button",
+          "label": "Login",
+          "isClickable": true
+        }
+      }
+    },
+    "cart": {
+      "name": "CartPage",
+      "url": "https://www.saucedemo.comcart.html",
+      "elements": {
+        "cartList": {
+          "selector": ".cart_list",
+          "type": "div",
+          "label": "Cart Items List"
+        },
+        "checkoutButton": {
+          "selector": ".checkout_button",
+          "type": "button",
+          "label": "Checkout",
+          "isClickable": true
+        }
+      }
+    }
+  },
+  "discoveredAt": "2026-08-17T06:05:35.477Z"
+}
