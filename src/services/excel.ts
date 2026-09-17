@@ -35,8 +35,7 @@ export class ExcelService {
           },
         ]);
         XLSX.utils.book_append_sheet(this.workbook, worksheet, 'TestPlans');
-        this.save();
-        this.logger.info('Created new test-plans.xlsx', {
+        this.logger.info('Initialized an empty in-memory scenario repository; it will be saved after the first workflow run.', {
           path: this.workbookPath,
         });
       }

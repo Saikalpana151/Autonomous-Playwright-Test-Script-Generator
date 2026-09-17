@@ -78,7 +78,7 @@ export class PlannerAgent {
           return {
             scenario: parsed.scenario || this.extractScenarioName(userStory),
             userStory,
-            steps: parsedSteps,
+            steps: parsedSteps.map((step: any, index: number) => this.normalizeStep(step, index)),
             applicationMapName: applicationMap.name,
             createdAt: new Date().toISOString(),
           };
@@ -126,6 +126,41 @@ export class PlannerAgent {
     }
 
     return [];
+  }
+
+  private normalizeStep(step: any, index: number): TestStep {
+    const action = String(step.action || 'Perform the required user-story action').trim();
+    const suppliedDescription = String(step.description || '').trim();
+    const description = suppliedDescription && suppliedDescription.toLowerCase() !== action.toLowerCase()
+      ? suppliedDescription
+      : this.describeAction(action);
+
+    return {
+      step: Number(step.step) || index + 1,
+      action,
+      description,
+      expectedResult: String(step.expectedResult || 'The expected result for this user-story action is observed').trim(),
+    };
+  }
+
+  private describeAction(action: string): string {
+    const normalized = action.toLowerCase();
+    if (normalized.includes('navigate') || normalized.includes('open')) {
+      return 'Open the target application page required by the user story.';
+    }
+    if (normalized.includes('login') || normalized.includes('credential')) {
+      return 'Enter the requested credentials and submit the login form.';
+    }
+    if (normalized.includes('add') && normalized.includes('cart')) {
+      return 'Locate the requested product and select its Add to cart control.';
+    }
+    if (normalized.includes('cart')) {
+      return 'Open the cart and inspect the items added during the workflow.';
+    }
+    if (normalized.includes('verify') || normalized.includes('validate') || normalized.includes('assert')) {
+      return 'Check the relevant UI element and compare it with the user story expectation.';
+    }
+    return `Perform the ${action.toLowerCase()} interaction described by the user story.`;
   }
 
   private createDefaultTestPlan(

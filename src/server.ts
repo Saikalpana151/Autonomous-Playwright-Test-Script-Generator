@@ -15,6 +15,7 @@ import { GeneratorAgent } from './agents/generator';
 import { ExecutorAgent } from './agents/executor';
 import { HealerAgent } from './agents/healer';
 import { ReportAgent } from './agents/report';
+import { EvaluationAgent } from './agents/evaluator';
 import { ProgressEvent } from './types';
 
 const app = express();
@@ -56,6 +57,7 @@ async function initializeServices(): Promise<void> {
     const executorAgent = new ExecutorAgent(logger, playwrightService, configService);
     const healerAgent = new HealerAgent(logger, llmService, fileSystemService);
     const reportAgent = new ReportAgent(logger, fileSystemService);
+    const evaluationAgent = new EvaluationAgent(logger, llmService, fileSystemService);
 
     orchestratorAgent = new OrchestratorAgent(
       logger,
@@ -69,6 +71,7 @@ async function initializeServices(): Promise<void> {
       executorAgent,
       healerAgent,
       reportAgent
+      , evaluationAgent
     );
 
     // Validate connections
@@ -164,9 +167,9 @@ app.post('/api/execute', async (req: Request, res: Response): Promise<void> => {
     lastReport = finalReport;
 
     broadcastProgress({
-      type: 'status',
-      message: 'Workflow completed',
-      details: { outcome: finalReport?.finalOutcome },
+      type: finalReport ? 'status' : 'error',
+      message: finalReport ? 'Workflow completed' : 'Workflow failed',
+      details: finalReport ? { outcome: finalReport.finalOutcome } : undefined,
       timestamp: new Date().toISOString(),
     });
 
@@ -225,7 +228,10 @@ app.get('/api/download/test', (_req: Request, res: Response): void => {
       return;
     }
 
-    res.download(testFile, 'generated-scenarios.spec.ts');
+    const content = fs.readFileSync(testFile, 'utf-8');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="generated-scenarios.spec.ts"');
+    res.send(content);
   } catch (error) {
     res.status(500).json({ error: 'Failed to download test file' });
   }
@@ -282,13 +288,12 @@ app.get('/api/artifacts', (_req: Request, res: Response): void => {
       testArtifacts: [],
     };
 
-    // Application maps
-    if (fs.existsSync('repositories/application-maps')) {
-      artifacts.applicationMaps = fs
-        .readdirSync('repositories/application-maps')
-        .filter((f) => f.endsWith('.json'))
-        .sort()
-        .reverse();
+    // Only expose artifacts belonging to the latest completed workflow.
+    if (lastReport?.applicationMap?.name) {
+      artifacts.applicationMaps = [`${lastReport.applicationMap.name}.json`];
+    } else if (fs.existsSync('repositories/application-maps')) {
+      artifacts.applicationMaps = fs.readdirSync('repositories/application-maps')
+        .filter((f) => f.endsWith('.json')).sort().reverse().slice(0, 1);
     }
 
     // Generated tests
@@ -298,10 +303,12 @@ app.get('/api/artifacts', (_req: Request, res: Response): void => {
 
     // Page objects
     const poDir = 'repositories/tests/page-objects';
-    if (fs.existsSync(poDir)) {
-      artifacts.pageObjects = fs
-        .readdirSync(poDir)
-        .filter((f) => f.endsWith('.ts'));
+    if (lastReport?.generatedFiles) {
+      artifacts.pageObjects = lastReport.generatedFiles
+        .filter((file: string) => file.includes('page-objects/') && file.endsWith('.ts'))
+        .map((file: string) => path.basename(file));
+    } else if (fs.existsSync(poDir)) {
+      artifacts.pageObjects = fs.readdirSync(poDir).filter((f) => f.endsWith('.ts'));
     }
 
     // Test artifacts

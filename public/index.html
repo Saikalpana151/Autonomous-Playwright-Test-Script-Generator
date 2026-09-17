@@ -503,6 +503,11 @@
                 <button class="btn-download" onclick="downloadReport()">⬇ Download Final Report</button>
                 <div id="reportContent"></div>
             </section>
+
+            <section id="evaluationSection" style="display: none;">
+                <h2>AI Evaluation Report</h2>
+                <div id="evaluationContent"></div>
+            </section>
         </main>
     </div>
 
@@ -554,6 +559,7 @@
             document.getElementById('artifactsSection').style.display = 'none';
             document.getElementById('excelSection').style.display = 'none';
             document.getElementById('reportSection').style.display = 'none';
+            document.getElementById('evaluationSection').style.display = 'none';
             
             // Clear content
             document.getElementById('progressList').innerHTML = '';
@@ -704,6 +710,7 @@
                 displayRepositoryEvidence();
                 displayArtifacts();
                 displayExcelInfo();
+                displayEvaluation();
             } catch (error) {
                 console.error('Failed to load report:', error);
             }
@@ -719,7 +726,7 @@
                 const content = document.getElementById('testPlanContent');
                 let html = '<table class="test-plan-table"><thead><tr><th>Step</th><th>Action</th><th>Description</th><th>Expected Result</th></tr></thead><tbody>';
                 currentReport.testPlan.steps.forEach(step => {
-                    html += `<tr><td>${step.step}</td><td>${step.action}</td><td>${step.description}</td><td>${step.expectedResult || 'N/A'}</td></tr>`;
+                    html += `<tr><td>${step.step}</td><td>${step.action || 'Perform user-story action'}</td><td>${step.description || step.action || 'Perform the action described by the user story'}</td><td>${step.expectedResult || 'The expected result for this user-story action is observed'}</td></tr>`;
                 });
                 html += '</tbody></table>';
                 content.innerHTML = html;
@@ -894,6 +901,93 @@
             html += `<p style="font-size: 0.95em; color: #555; word-break: break-word; line-height: 1.6;">${escapeHtml(workflow)}</p>`;
             html += '</div>';
 
+            const healerDetails = currentReport.healerDetails;
+            const intentionalFailure = currentReport.intentionalFailure;
+            const recoveryHistory = currentReport.recoveryHistory || [];
+            if (intentionalFailure && intentionalFailure.enabled && healerDetails && healerDetails.triggered) {
+                html += '<div style="margin-top: 20px; padding: 20px; background: #f1f5ff; border-radius: 8px; border-left: 4px solid #2196f3;">';
+                html += '<h3 style="color: #1769aa; margin-bottom: 10px;">Intentional Failure Diagnostics</h3>';
+                html += `<p><strong>Selected Type:</strong> ${escapeHtml(intentionalFailure.type || 'Unknown')}</p>`;
+                html += `<p><strong>Affected Agent:</strong> ${escapeHtml(intentionalFailure.affectedAgent || 'Unknown')}</p>`;
+                html += `<p><strong>Reason:</strong> ${escapeHtml(intentionalFailure.reason || 'Not recorded')}</p>`;
+                html += `<p><strong>Defect:</strong> ${escapeHtml(intentionalFailure.injectedDefect || 'Not recorded')}</p>`;
+                html += `<p><strong>Injected File:</strong> ${escapeHtml(intentionalFailure.injectedFile || 'Not recorded')}</p>`;
+                html += `<p><strong>Injected Line:</strong> ${escapeHtml(String(intentionalFailure.injectedLine || 'Not recorded'))}</p>`;
+                html += `<p><strong>Injected Stage:</strong> ${escapeHtml(intentionalFailure.injectedAtStage || intentionalFailure.affectedAgent || 'Not recorded')}</p>`;
+                html += `<p><strong>Recovery Route:</strong> ${escapeHtml((intentionalFailure.recoveryRoute || []).join(' → ') || 'Not recorded')}</p>`;
+                html += `<p><strong>Run:</strong> ${escapeHtml(currentReport.runId || 'Unknown')}</p></div>`;
+            }
+            if (recoveryHistory.length > 0) {
+                html += '<div style="margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 8px; border-left: 4px solid #667eea;">';
+                html += '<h3 style="color: #667eea; margin-bottom: 10px;">Recovery Route History</h3>';
+                recoveryHistory.forEach(record => {
+                    html += `<p><strong>${escapeHtml(record.action)}</strong> ${escapeHtml(record.agent)}: ${escapeHtml(record.reason)}<br><small>Route: ${escapeHtml((record.route || []).join(' → '))}</small></p>`;
+                });
+                html += '</div>';
+            }
+            if (healerDetails && healerDetails.triggered) {
+                html += '<div style="margin-top: 20px; padding: 20px; background: #fff9f5; border-radius: 8px; border-left: 4px solid #ff9800;">';
+                html += '<h3 style="color: #e07b00; margin-bottom: 10px;">Healer Diagnostics</h3>';
+                html += `<p><strong>Root Cause:</strong> ${escapeHtml(healerDetails.rootCause || 'Unknown')}</p>`;
+                html += `<p><strong>Fix Applied:</strong> ${escapeHtml(healerDetails.fixStrategy || 'No fix was applied')}</p>`;
+                html += `<p><strong>Healer Invocations:</strong> ${healerDetails.iterations || healerDetails.healingAttempts?.length || 0}</p>`;
+                const healingAttempts = healerDetails.healingAttempts || [];
+                healingAttempts.forEach(attempt => {
+                    html += '<div style="padding: 10px 0; border-top: 1px solid #eadccf;">';
+                    html += `<p><strong>Healing Attempt ${attempt.attempt}:</strong> ${escapeHtml(attempt.fixApplied || 'No fix applied')}</p>`;
+                    html += `<p><strong>Affected Test:</strong> ${escapeHtml(attempt.affectedTest || 'Current generated test')}</p>`;
+                    html += `<p><strong>Affected File:</strong> ${escapeHtml(attempt.affectedFile || 'Generated test file')}</p>`;
+                    html += `<p><strong>Root Cause:</strong> ${escapeHtml(attempt.rootCauseExplanation || 'Not recorded')}</p>`;
+                    html += `<p><strong>Suggested Agents:</strong> ${escapeHtml((attempt.suggestedAgents || []).join(' → ') || 'Not recorded')}</p>`;
+                    html += `<p><strong>Repair Confidence:</strong> ${attempt.confidenceScore == null ? 'Not recorded' : `${Math.round(attempt.confidenceScore * 100)}%`}</p>`;
+                    html += '</div>';
+                });
+                html += '</div>';
+            }
+
+            content.innerHTML = html;
+        }
+
+        function displayEvaluation() {
+            const evaluation = currentReport && currentReport.evaluation;
+            const section = document.getElementById('evaluationSection');
+            const content = document.getElementById('evaluationContent');
+            if (!evaluation) {
+                section.style.display = 'none';
+                return;
+            }
+
+            section.style.display = 'block';
+            const categories = [
+                ['Explorer Accuracy', evaluation.explorerAccuracy],
+                ['Test Plan Accuracy', evaluation.testPlanAccuracy],
+                ['Generated Test Accuracy', evaluation.generatedTestAccuracy],
+                ['Execution Accuracy', evaluation.executionAccuracy],
+                ['Report Accuracy', evaluation.reportAccuracy],
+            ];
+            let html = `<div class="info-box"><h3>Overall Evaluation Score</h3><p>${evaluation.overallScore}%</p><small>Deterministic weighted score. NOT_EVALUABLE criteria are excluded from the denominator.</small></div>`;
+            html += '<div class="report-summary">';
+            categories.forEach(([label, category]) => {
+                const counts = ['PASS', 'PARTIAL', 'FAIL', 'NOT_EVALUABLE'].map(result => `${result}: ${category.criteria.filter(c => c.result === result).length}`).join(' · ');
+                html += `<div class="report-item"><strong>${label}</strong><p>${category.score}%</p><small>${category.criteria.length} criteria · ${counts}</small></div>`;
+            });
+            html += '</div><div class="info-grid">';
+            categories.forEach(([label, category]) => {
+                html += `<div class="info-box"><h3>${label} · ${category.score}%</h3>`;
+                category.criteria.forEach(criterion => {
+                    html += `<details style="margin: 12px 0; border-top: 1px solid #e0e0e0; padding-top: 10px;"><summary><strong>${escapeHtml(criterion.result)}</strong> ${escapeHtml(criterion.criterion)}</summary>`;
+                    html += `<p><strong>What was evaluated:</strong> ${escapeHtml(criterion.whatWasEvaluated || criterion.objective || '')}</p>`;
+                    html += `<p><strong>Expected:</strong> ${escapeHtml(criterion.expected || '')}</p><p><strong>Actual:</strong> ${escapeHtml(criterion.actual || '')}</p>`;
+                    html += `<p><strong>Semantic mapping:</strong> ${escapeHtml(criterion.semanticMapping || '')}</p><p><strong>Evidence:</strong> ${escapeHtml(criterion.evidence || '')}</p>`;
+                    html += `<p><strong>Justification:</strong> ${escapeHtml(criterion.justification || criterion.reason || '')}</p><p><strong>Gaps:</strong> ${escapeHtml(criterion.gaps || '')}</p>`;
+                    html += `<p><strong>Impact:</strong> ${escapeHtml(criterion.impact || '')} · <strong>Severity:</strong> ${escapeHtml(criterion.severity || '')} · <strong>Confidence:</strong> ${escapeHtml(criterion.confidence || '')}</p>`;
+                    html += `<p><strong>Defect attribution:</strong> ${escapeHtml(criterion.defectAttribution || '')}</p><p><strong>Recommendation:</strong> ${escapeHtml(criterion.recommendation || '')}</p>`;
+                    html += `<p><strong>Score contribution:</strong> ${escapeHtml(String(criterion.scoreContribution ?? ''))} · <strong>Calculation:</strong> ${escapeHtml(criterion.scoreCalculation || '')}</p>`;
+                    html += `<p><strong>Source of truth:</strong> ${escapeHtml(criterion.sourceOfTruth || '')} · <strong>Cross-stage consistency:</strong> ${escapeHtml(criterion.crossStageConsistency || '')}</p></details>`;
+                });
+                html += '</div>';
+            });
+            html += '</div>';
             content.innerHTML = html;
         }
 

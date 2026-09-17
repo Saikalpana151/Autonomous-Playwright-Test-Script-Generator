@@ -13,6 +13,7 @@ import {
   FinalReport,
   ExcelRow,
   ProgressEvent,
+  IntentionalFailure,
 } from '../types';
 import { ExplorerAgent } from './explorer.js';
 import { PlannerAgent } from './planner.js';
@@ -20,6 +21,7 @@ import { GeneratorAgent } from './generator.js';
 import { ExecutorAgent } from './executor.js';
 import { HealerAgent } from './healer.js';
 import { ReportAgent } from './report.js';
+import { EvaluationAgent } from './evaluator.js';
 
 export type ProgressCallback = (event: ProgressEvent) => void;
 
@@ -35,6 +37,7 @@ export class OrchestratorAgent {
   private executorAgent: ExecutorAgent;
   private healerAgent: HealerAgent;
   private reportAgent: ReportAgent;
+  private evaluationAgent: EvaluationAgent;
   private llmConnectionStatus: LLMConnectionStatus;
   private mcpConnectionStatus: MCPConnectionStatus;
   private progressCallback: ProgressCallback | null = null;
@@ -51,6 +54,7 @@ export class OrchestratorAgent {
     executorAgent: ExecutorAgent,
     healerAgent: HealerAgent,
     reportAgent: ReportAgent
+    , evaluationAgent: EvaluationAgent
   ) {
     this.logger = logger;
     this.configService = _configService;
@@ -63,6 +67,7 @@ export class OrchestratorAgent {
     this.executorAgent = executorAgent;
     this.healerAgent = healerAgent;
     this.reportAgent = reportAgent;
+    this.evaluationAgent = evaluationAgent;
     this.llmConnectionStatus = {
       connected: false,
       model: _configService.get('geminiModel'),
@@ -169,6 +174,7 @@ export class OrchestratorAgent {
 
       // Initialize execution context
       const context: ExecutionContext = {
+        runId: `run-${Date.now()}`,
         userStory,
         scenario: '',
         applicationMap: null,
@@ -177,9 +183,32 @@ export class OrchestratorAgent {
         executionResults: null,
         retryCount: 0,
         maxRetries: 3,
+        maxHealerAttempts: 3,
+        healerInvocationCount: 0,
+        executionOutcomes: [],
         startTime: new Date(),
+        agentInvocations: {},
+        healingRecords: [],
+        generatedPageObjects: [],
+        generatedTestPath: this.fileSystemService.getGeneratedTestsFile(),
         resolvedCredentials,
+        recoveryHistory: [],
       };
+
+      if (this.configService.isIntentionalFailureEnabled()) {
+        context.intentionalFailure = this.selectIntentionalFailure(userStory, context.runId, this.configService.get('intentionalFailureSeed'));
+        context.intentionalFailure.injectedFile = 'src/agents/orchestrator.ts';
+        context.intentionalFailure.injectedLine = this.findSourceLine(context.intentionalFailure.affectedAgent || 'Executor');
+        context.intentionalFailure.injectedAtStage = context.intentionalFailure.affectedAgent;
+        context.recoveryHistory.push({
+          stage: context.intentionalFailure.affectedAgent || 'Executor',
+          agent: context.intentionalFailure.affectedAgent || 'Executor',
+          action: 'INJECTED',
+          route: context.intentionalFailure.recoveryRoute || [],
+          reason: context.intentionalFailure.reason || 'Scenario-relevant intentional failure enabled',
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       // Step 3: Check if exact scenario already exists and still has the required executable artifacts
       let existingScenario = this.excelService.scenarioExists(userStory);
@@ -210,18 +239,29 @@ export class OrchestratorAgent {
         }
       }
 
+      if (context.intentionalFailure?.enabled) {
+        scenarioReused = false;
+        existingScenario = null;
+        this.logger.info('Intentional failure validation disables repository reuse for this run');
+      }
+
+      if (!scenarioReused) {
+        this.fileSystemService.clearRunArtifacts();
+        this.fileSystemService.clearGeneratedPageObjects();
+      }
+
       // Step 4: Invoke Explorer Agent if needed
       if (!scenarioReused) {
-        this.emitProgress({
-          type: 'agent-start',
-          message: 'Explorer Agent starting',
-          timestamp: new Date().toISOString(),
-        });
+        this.emitAgentStart(context, 'Explorer');
         this.logger.info('Invoking Explorer Agent...');
+        const explorerFailure = this.consumeIntentionalStageFailure(context, 'Explorer');
         context.applicationMap = await this.explorerAgent.explore(userStory, resolvedCredentials);
 
         if (!context.applicationMap) {
           throw new Error('Explorer Agent failed to create application map');
+        }
+        if (explorerFailure) {
+          this.injectExplorerDefect(context);
         }
         this.emitProgress({
           type: 'agent-end',
@@ -245,26 +285,30 @@ export class OrchestratorAgent {
 
       // Step 5: Invoke Planner Agent if needed
       if (!scenarioReused && context.applicationMap) {
-        this.emitProgress({
-          type: 'agent-start',
-          message: 'Planner Agent starting',
-          timestamp: new Date().toISOString(),
-        });
+        this.emitAgentStart(context, 'Planner');
         this.logger.info('Invoking Planner Agent...');
-        context.testPlan = await this.plannerAgent.plan(
-          userStory,
-          context.applicationMap
-        );
-
-        if (!context.testPlan) {
-          throw new Error('Planner Agent failed to create test plan');
+        const plannerFailure = this.consumeIntentionalStageFailure(context, 'Planner');
+        context.testPlan = await this.plannerAgent.plan(userStory, context.applicationMap);
+        if (plannerFailure) {
+          this.logger.warn('Intentional Planner defect selected; preserving an incorrect plan for evaluation');
+          this.recordRecovery(context, 'Planner', ['Planner', 'Generator', 'Executor'], 'Planner defect preserved for evaluation');
+          if (context.testPlan?.steps.length) {
+            const lastStep = context.testPlan.steps[context.testPlan.steps.length - 1];
+            lastStep.expectedResult = '';
+            lastStep.description = 'Planner defect: verification requirement omitted';
+          }
         }
 
-        context.scenario = context.testPlan.scenario;
+        if (!context.testPlan) {
+          this.logger.warn('Planner failed; routing to Generator with the current User Story');
+          context.scenario = this.scenarioFromUserStory(userStory);
+        } else {
+          context.scenario = context.testPlan.scenario;
+        }
         this.emitProgress({
           type: 'agent-end',
           message: 'Planner Agent completed',
-          details: { steps: context.testPlan.steps.length },
+          details: { steps: context.testPlan?.steps.length || 0 },
           timestamp: new Date().toISOString(),
         });
       } else if (scenarioReused) {
@@ -276,24 +320,51 @@ export class OrchestratorAgent {
       }
 
       // Step 6: Invoke Generator Agent
-      this.emitProgress({
-        type: 'agent-start',
-        message: 'Generator Agent starting',
-        timestamp: new Date().toISOString(),
-      });
+      this.emitAgentStart(context, 'Generator');
       this.logger.info('Invoking Generator Agent...');
+      const generatorFailure = this.consumeIntentionalStageFailure(context, 'Generator');
+      if (generatorFailure) {
+        this.logger.warn('Intentional Generator defect selected; generating faulty source for Executor validation');
+        this.recordRecovery(context, 'Generator', ['Generator', 'Executor'], 'Generator defect injected into generated source');
+      }
       if (context.applicationMap) {
         context.generatedTest = await this.generatorAgent.generate(
-          context.scenario,
-          context.applicationMap,
-          context.testPlan,
-          scenarioReused,
-          userStory
+          context.scenario, context.applicationMap, context.testPlan, scenarioReused, userStory, context.intentionalFailure
         );
       }
 
       if (!context.generatedTest) {
-        throw new Error('Generator Agent failed to generate test');
+        this.logger.warn('Generator failed; retrying Generator before Executor');
+        this.emitAgentStart(context, 'Generator');
+        context.generatedTest = context.applicationMap
+          ? await this.generatorAgent.generate(
+            context.scenario,
+            context.applicationMap,
+            context.testPlan,
+            false,
+            userStory,
+            context.intentionalFailure
+          )
+          : null;
+        if (!context.generatedTest) {
+          throw new Error('Generator Agent failed to generate test');
+        }
+      }
+      context.generatedPageObjects = context.applicationMap
+        ? Object.values(context.applicationMap.pages)
+          .map((page) => `${page.name}.ts`)
+          .filter((file, index, files) => files.indexOf(file) === index && fs.existsSync(`repositories/tests/page-objects/${file}`))
+        : [];
+      if (context.generatedTest?.includes('intentional-failure:') && context.intentionalFailure) {
+        const failureMatch = context.generatedTest.match(/intentional-failure:\s*([A-Z_]+);\s*seed=(\d+)/);
+        context.intentionalFailure.type = failureMatch?.[1] as any || context.intentionalFailure.type;
+        context.intentionalFailure.seed = failureMatch ? Number(failureMatch[2]) : context.intentionalFailure.seed;
+        context.intentionalFailure.injectedDefect = `Generated source mutation: ${context.intentionalFailure.type}`;
+        const sourceLocation = context.generatedTest.match(/file=([^;]+);\s*line=(\d+)/);
+        context.intentionalFailure.injectedFile = sourceLocation?.[1] || context.generatedTestPath;
+        context.intentionalFailure.injectedLine = sourceLocation ? Number(sourceLocation[2]) : undefined;
+        context.intentionalFailure.injectedAtStage = context.intentionalFailure.affectedAgent;
+        context.intentionalFailure.recordedAt = new Date().toISOString();
       }
       this.emitProgress({
         type: 'agent-end',
@@ -302,25 +373,35 @@ export class OrchestratorAgent {
       });
 
       // Step 7: Execute test
-      let executionAttempt = 1;
+      let executionAttempt = 0;
       let executionSuccess = false;
       context.healerInvoked = false;
 
       while (executionAttempt <= context.maxRetries && !executionSuccess) {
-        this.logger.info(`\nExecution Attempt ${executionAttempt}/${context.maxRetries}`);
-        this.emitProgress({
-          type: 'agent-start',
-          message: `Executor Agent starting (Attempt ${executionAttempt}/${context.maxRetries})`,
-          timestamp: new Date().toISOString(),
-        });
+        this.emitAgentStart(context, 'Executor');
+        executionAttempt++;
+        const retryAttempt = executionAttempt - 1;
+        this.logger.info(retryAttempt === 0 ? '\nInitial execution' : `\nExecution retry Attempt ${retryAttempt}/${context.maxRetries}`);
 
         try {
           this.logger.info('Invoking Executor Agent...');
-          context.executionResults = await this.executorAgent.execute(
+          const previousFailures = context.executionResults?.retryInfo.failures || [];
+          const currentExecutionResults = await this.executorAgent.execute(
             context.scenario,
             'chromium',
-            this.fileSystemService.getGeneratedTestsFile()
+            context.generatedTestPath
           );
+          if (currentExecutionResults) {
+            currentExecutionResults.retryInfo.failures = [
+              ...previousFailures,
+              ...currentExecutionResults.retryInfo.failures,
+            ];
+          }
+          context.executionResults = currentExecutionResults;
+          if (context.executionResults) {
+            context.executionResults.retryInfo.attempts = retryAttempt;
+          }
+          context.executionOutcomes.push(Boolean(currentExecutionResults?.passed));
 
           if (context.executionResults && context.executionResults.passed) {
             executionSuccess = true;
@@ -333,52 +414,76 @@ export class OrchestratorAgent {
             });
           } else {
             this.logger.info('EXECUTOR FAILED');
+            if (context.executionResults) {
+              context.executionResults.retryInfo.attempts = executionAttempt;
+            }
             this.emitProgress({
               type: 'agent-end',
               message: 'Executor Agent completed - FAILED',
-              details: {
-                error: context.executionResults?.error,
-                attempt: executionAttempt,
-              },
               timestamp: new Date().toISOString(),
             });
 
-            if (executionAttempt < context.maxRetries) {
-              this.logger.info('INVOKING HEALER');
-              this.emitProgress({
-                type: 'agent-start',
-                message: 'Healer Agent starting',
-                details: { rootCause: context.executionResults?.error },
-                timestamp: new Date().toISOString(),
-              });
-              context.healerInvoked = true;
-              const healingRequired = await this.healerAgent.analyze(
-                context.executionResults,
-                context.applicationMap,
-                context.testPlan
-              );
-
-              if (healingRequired) {
-                this.logger.info('HEALER FIX APPLIED');
-                this.logger.info('RETRYING EXECUTOR');
-                this.emitProgress({
-                  type: 'agent-end',
-                  message: 'Healer Agent completed - fix applied, retrying',
-                  timestamp: new Date().toISOString(),
-                });
-              } else {
-                this.logger.warn('Healer did not apply a fix');
-                this.emitProgress({
-                  type: 'agent-end',
-                  message: 'Healer Agent completed - no fix available',
-                  timestamp: new Date().toISOString(),
-                });
-              }
+            this.logger.info('INVOKING HEALER FOR CROSS-STAGE DIAGNOSIS');
+            this.emitAgentStart(context, 'Healer');
+            context.healerInvocationCount += 1;
+            context.healerInvoked = true;
+            const healingResult = await this.healerAgent.analyze(
+              context.executionResults,
+              context.applicationMap,
+              context.testPlan,
+              context.generatedTest || '',
+              context.intentionalFailure
+            );
+            if (healingResult.record) context.healingRecords.push(healingResult.record);
+            const diagnostic = healingResult.diagnostic;
+            const suggestedAgents = diagnostic?.suggestedAgents || [];
+            this.emitProgress({
+              type: 'agent-end',
+              message: 'Healer Agent completed - diagnostic returned',
+              details: {
+                classification: diagnostic?.classification,
+                suggestedAgents,
+                confidenceScore: diagnostic?.confidenceScore,
+                rootCause: diagnostic?.rootCauseExplanation,
+              },
+              timestamp: new Date().toISOString(),
+            });
+            if (executionAttempt > context.maxRetries) {
+              context.retryCount = retryAttempt;
+              this.logger.warn('Retry limit reached after final Healer diagnosis; stopping recovery');
+              break;
+            }
+            if (suggestedAgents.includes('Explorer') && context.applicationMap) {
+              this.recordRecovery(context, 'Explorer', ['Explorer', 'Planner', 'Generator', 'Executor'], diagnostic?.rootCauseExplanation || 'Explorer evidence requires re-validation');
+              this.emitAgentStart(context, 'Explorer');
+              context.applicationMap = await this.explorerAgent.explore(userStory, resolvedCredentials);
+              this.emitProgress({ type: 'agent-end', message: 'Explorer Agent recovery completed', timestamp: new Date().toISOString() });
+            }
+            if (suggestedAgents.includes('Planner') && context.applicationMap) {
+              this.recordRecovery(context, 'Planner', ['Planner', 'Generator', 'Executor'], diagnostic?.rootCauseExplanation || 'Planner alignment requires re-validation');
+              this.emitAgentStart(context, 'Planner');
+              context.testPlan = await this.plannerAgent.plan(userStory, context.applicationMap);
+              context.scenario = context.testPlan?.scenario || context.scenario;
+              this.emitProgress({ type: 'agent-end', message: 'Planner Agent recovery completed', timestamp: new Date().toISOString() });
+            }
+            if (suggestedAgents.includes('Generator') && context.applicationMap) {
+              this.recordRecovery(context, 'Generator', ['Generator', 'Executor'], diagnostic?.rootCauseExplanation || 'Generated implementation requires regeneration');
+              this.emitAgentStart(context, 'Generator');
+              context.generatedTest = await this.generatorAgent.generate(context.scenario, context.applicationMap, context.testPlan, false, userStory);
+              this.emitProgress({ type: 'agent-end', message: 'Generator Agent recovery completed', timestamp: new Date().toISOString() });
+            }
+            if (suggestedAgents.includes('Healer') && healingResult.applied && executionAttempt <= context.maxRetries) {
+              this.recordRecovery(context, 'Healer', ['Healer', 'Executor'], diagnostic?.rootCauseExplanation || 'Runtime repair applied');
+              this.logger.info('HEALER FIX APPLIED; RETRYING EXECUTOR');
+            } else if (suggestedAgents.includes('Executor') && (healingResult.applied || suggestedAgents.some((agent) => ['Explorer', 'Planner', 'Generator'].includes(agent)))) {
+              this.recordRecovery(context, 'Executor', ['Executor'], 'Re-running after upstream recovery');
+            } else {
+              this.logger.warn(`No safe recovery route selected for ${diagnostic?.classification || 'unknown failure'}`);
+              break;
             }
           }
 
-          executionAttempt++;
-          context.retryCount = executionAttempt - 1;
+          context.retryCount = Math.max(0, executionAttempt - 1);
         } catch (error) {
           this.logger.error(`Execution attempt ${executionAttempt} failed`, error);
           this.emitProgress({
@@ -387,10 +492,9 @@ export class OrchestratorAgent {
             details: { error: error instanceof Error ? error.message : String(error) },
             timestamp: new Date().toISOString(),
           });
-          executionAttempt++;
-          context.retryCount = executionAttempt - 1;
+          context.retryCount = Math.max(0, executionAttempt - 1);
 
-          if (executionAttempt > context.maxRetries) {
+          if (executionAttempt >= context.maxRetries) {
             throw error;
           }
         }
@@ -433,14 +537,32 @@ export class OrchestratorAgent {
         scenarioReused
       );
 
-      context.endTime = new Date();
-
       this.emitProgress({
         type: 'agent-end',
         message: 'Report Agent completed',
         details: { outcome: finalReport?.finalOutcome },
         timestamp: new Date().toISOString(),
       });
+
+      context.endTime = new Date();
+
+      try {
+        this.emitProgress({
+          type: 'agent-start',
+          message: 'Evaluation Agent starting',
+          timestamp: new Date().toISOString(),
+        });
+        finalReport.evaluation = await this.evaluationAgent.evaluate(context, finalReport);
+        this.fileSystemService.saveJson('execution-report.json', finalReport);
+        this.emitProgress({
+          type: 'agent-end',
+          message: 'Evaluation Agent completed',
+          details: { overallScore: finalReport.evaluation.overallScore },
+          timestamp: new Date().toISOString(),
+        });
+      } catch (evaluationError) {
+        this.logger.warn('Evaluation Agent failed; returning the final report without evaluation', evaluationError);
+      }
 
       return finalReport;
     } catch (error) {
@@ -456,13 +578,34 @@ export class OrchestratorAgent {
   }
 
   private resolveCredentials(userStory: string): { username: string; password: string } {
-    const explicitUsername = userStory.match(/(?:username|user(?:name)?\s*[:=]\s*|login\s+with\s+|with\s+)([A-Za-z0-9_.-]+)/i)?.[1]?.trim();
+    if (/\blocked\s+users?\b/i.test(userStory) || /\blocked[_ -]out[_ -]user\b/i.test(userStory)) {
+      return { username: 'locked_out_user', password: this.configService.get('defaultPassword') };
+    }
+    const explicitUsername = userStory.match(/(?:username|user(?:name)?\s*[:=]\s*|login\s+with\s+)([A-Za-z0-9_.-]+)/i)?.[1]?.trim();
     const explicitPassword = userStory.match(/(?:password\s*(?:is|=|:)?\s*)([A-Za-z0-9_.!@#$%^&*()-+=]+)/i)?.[1]?.trim();
 
     return {
       username: explicitUsername || this.configService.get('defaultUsername'),
       password: explicitPassword || this.configService.get('defaultPassword'),
     };
+  }
+
+  private emitAgentStart(context: ExecutionContext, agentName: string): void {
+    const previousInvocations = context.agentInvocations[agentName] || 0;
+    context.agentInvocations[agentName] = previousInvocations + 1;
+    const retryLabel = previousInvocations > 0
+      ? ` (Attempt ${previousInvocations}/${context.maxRetries})`
+      : '';
+    this.emitProgress({
+      type: 'agent-start',
+      message: `${agentName} Agent starting${retryLabel}`,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private scenarioFromUserStory(userStory: string): string {
+    const normalized = userStory.trim().replace(/\s+/g, ' ');
+    return normalized.length > 80 ? `${normalized.slice(0, 77)}...` : normalized;
   }
 
   private pageObjectsExistForCurrentStory(userStory: string): boolean {
@@ -480,6 +623,82 @@ export class OrchestratorAgent {
       const pageObjectPath = `${this.fileSystemService['testDir']}/page-objects/${pageObjectName}.ts`;
       return fs.existsSync(pageObjectPath);
     });
+  }
+
+  private selectIntentionalFailure(userStory: string, runId: string, configuredSeed = ''): IntentionalFailure {
+    const choices: IntentionalFailure[] = [
+      { enabled: true, type: 'EXPLORER_FAILURE', affectedAgent: 'Explorer', reason: 'Exercise application-map recovery for the current story', recoveryRoute: ['Explorer', 'Planner', 'Generator', 'Executor'] },
+      { enabled: true, type: 'PLANNER_FAILURE', affectedAgent: 'Planner', reason: 'Exercise test-plan recovery using the current application map', recoveryRoute: ['Planner', 'Generator', 'Executor'] },
+      { enabled: true, type: 'GENERATOR_FAILURE', affectedAgent: 'Generator', reason: 'Exercise generated-test recovery using the current plan', recoveryRoute: ['Generator', 'Executor'] },
+      { enabled: true, type: 'INCORRECT_SELECTOR', affectedAgent: 'Executor', reason: 'Exercise runtime locator healing for the current generated test', recoveryRoute: ['Healer', 'Executor'] },
+    ];
+
+    const randomValue = configuredSeed
+      ? (() => {
+          const hash = [...`${userStory}:${configuredSeed}:${runId}`].reduce((value, character) => (value * 31 + character.charCodeAt(0)) >>> 0, 7);
+          const normalized = hash % 1000;
+          return normalized / 1000;
+        })()
+      : Math.random();
+    const index = Math.floor(randomValue * choices.length) % choices.length;
+    const selected = choices[index];
+    return { ...selected, seed: index, recordedAt: new Date().toISOString() };
+  }
+
+  private consumeIntentionalStageFailure(context: ExecutionContext, agent: string): boolean {
+    return Boolean(
+      context.intentionalFailure?.enabled &&
+      context.intentionalFailure.affectedAgent === agent &&
+      !context.recoveryHistory.some((record) => record.stage === agent && record.action === 'RECOVERY')
+    );
+  }
+
+  private recordRecovery(context: ExecutionContext, agent: string, route: string[], reason: string): void {
+    context.recoveryHistory.push({
+      stage: agent,
+      agent,
+      action: 'RECOVERY',
+      route,
+      reason,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private injectExplorerDefect(context: ExecutionContext): void {
+    const map = context.applicationMap;
+    if (!map) return;
+
+    const loginElements = map.pages.login?.elements;
+    const usernameElement = loginElements?.username;
+    if (!usernameElement) return;
+
+    usernameElement.selector = '#intentional-invalid-user-name';
+    map.elements.username = usernameElement.selector;
+    this.fileSystemService.saveApplicationMap(map);
+
+    const mapPath = `repositories/application-maps/${map.name}.json`;
+    const mapSource = fs.readFileSync(mapPath, 'utf8').split(/\r?\n/);
+    const changedLine = mapSource.findIndex((line) => line.includes('intentional-invalid-user-name')) + 1;
+    if (context.intentionalFailure) {
+      context.intentionalFailure.injectedFile = mapPath;
+      context.intentionalFailure.injectedLine = changedLine;
+      context.intentionalFailure.injectedAtStage = 'Explorer';
+      context.intentionalFailure.injectedDefect = 'Explorer username selector changed to #intentional-invalid-user-name';
+    }
+    this.logger.warn(`Intentional Explorer defect injected at ${mapPath}:${changedLine}`);
+  }
+
+  private findSourceLine(agent: string): number {
+    const source = fs.readFileSync('src/agents/orchestrator.ts', 'utf8').split(/\r?\n/);
+    const marker = agent === 'Explorer'
+      ? 'const explorerFailure ='
+      : agent === 'Planner'
+        ? 'const plannerFailure ='
+        : agent === 'Generator'
+          ? 'const generatorFailure ='
+          : 'const currentExecutionResults =';
+    const lineIndex = source.findIndex((line) => line.includes(marker));
+    return lineIndex >= 0 ? lineIndex + 1 : 0;
   }
 
   getLLMConnectionStatus(): LLMConnectionStatus {

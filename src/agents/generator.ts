@@ -2,21 +2,19 @@
 import { Logger } from '../services/logger';
 import { FileSystemService } from '../services/filesystem';
 import { LLMService } from '../services/llm';
-import { ApplicationMap, TestPlan } from '../types';
+import { ApplicationMap, IntentionalFailure, TestPlan } from '../types';
 
 export class GeneratorAgent {
   private logger: Logger;
   private fileSystemService: FileSystemService;
-  private llmService: LLMService;
 
   constructor(
     logger: Logger,
     fileSystemService: FileSystemService,
-    llmService: LLMService
+    _llmService: LLMService
   ) {
     this.logger = logger;
     this.fileSystemService = fileSystemService;
-    this.llmService = llmService;
   }
 
   async generate(
@@ -24,7 +22,8 @@ export class GeneratorAgent {
     applicationMap: ApplicationMap,
     testPlan: TestPlan | null,
     isReused: boolean,
-    userStory?: string
+    userStory?: string,
+    intentionalFailure?: IntentionalFailure
   ): Promise<string | null> {
     try {
       this.logger.info('\n==================================================');
@@ -43,9 +42,6 @@ export class GeneratorAgent {
         this.logger.warn('⚠ Reused test files not found. Regenerating autonomously from user story...');
       }
 
-      // Always clear the generated spec file to ensure only current test runs
-      this.fileSystemService.clearGeneratedTestFile();
-
       // Generate only the page objects needed by the active scenario
       // Use user story if available for better autonomous regeneration
       const contextForGeneration = userStory || scenario;
@@ -53,30 +49,21 @@ export class GeneratorAgent {
 
       // Generate test code
       let testCode = this.generateDefaultTestCode(scenario, applicationMap, testPlan, contextForGeneration);
+      testCode = this.applyApplicationMapSelectors(testCode, applicationMap);
 
       // Try to enhance with LLM if test plan is available
-      if (testPlan && testPlan.steps && testPlan.steps.length > 0) {
-        try {
-          const enhancedCode = await this.generateTestCodeWithLLM(
-            testPlan,
-            applicationMap
-          );
-          if (enhancedCode) {
-            testCode = enhancedCode;
-          }
-        } catch (error) {
-          this.logger.warn('LLM code generation failed, using default template', error);
-        }
+      if (intentionalFailure?.enabled && (intentionalFailure.affectedAgent === 'Executor' || intentionalFailure.affectedAgent === 'Generator')) {
+        testCode = this.injectIntentionalFailure(testCode, contextForGeneration, intentionalFailure.type);
       }
 
-      if (process.env.INTENTIONAL_TEST_FAILURE === 'true') {
-        testCode = this.injectIntentionalFailure(testCode);
-      }
+      // Generator persists source for Executor validation. Semantic coverage is evaluated
+      // after execution; a faulty Explorer map must reach the browser instead of being
+      // rejected before runtime evidence exists.
 
       // Append test code to master test file
       this.fileSystemService.appendTestCode(testCode);
 
-      this.logger.info('✓ Test code generated and appended');
+      this.logger.info('✓ One current-user-story test generated');
       this.logger.info(`✓ Scenario: ${scenario}`);
       this.logger.info('==================================================\n');
 
@@ -324,10 +311,13 @@ export class ConfirmationPage {
   }
 
   private extractUsername(userStory: string): string | undefined {
+    if (/\blocked\s+users?\b/i.test(userStory) || /\blocked[_ -]out[_ -]user\b/i.test(userStory)) {
+      return 'locked_out_user';
+    }
     const patterns = [
-      /(?:login\s+with\s+|with\s+|user(?:name)?\s*(?:=|:)?\s*)"([^"]+)"/i,
-      /(?:login\s+with\s+|with\s+|user(?:name)?\s*(?:=|:)?\s*)'([^']+)'/i,
-      /(?:login\s+with\s+|with\s+|user(?:name)?\s*(?:=|:)?\s*)([A-Za-z0-9_.-]+)/i,
+      /(?:login\s+with\s+|user(?:name)?\s*(?:=|:)??\s*)"([^"]+)"/i,
+      /(?:login\s+with\s+|user(?:name)?\s*(?:=|:)??\s*)'([^']+)'/i,
+      /(?:login\s+with\s+|user(?:name)?\s*(?:=|:)??\s*)([A-Za-z0-9_.-]+)/i,
     ];
 
     for (const pattern of patterns) {
@@ -342,9 +332,9 @@ export class ConfirmationPage {
 
   private extractPassword(userStory: string): string | undefined {
     const patterns = [
-      /(?:password\s*(?:is|=|:)?\s*|and\s+|using\s+)"([^"]+)"/i,
-      /(?:password\s*(?:is|=|:)?\s*|and\s+|using\s+)'([^']+)'/i,
-      /(?:password\s*(?:is|=|:)?\s*|and\s+|using\s+)([A-Za-z0-9_.!@#$%^&*()-+=]+)/i,
+      /password\s*(?:is|=|:)?\s*"([^"]+)"/i,
+      /password\s*(?:is|=|:)?\s*'([^']+)'/i,
+      /password\s*(?:is|=|:)?\s*([A-Za-z0-9_.!@#$%^&*()-+=]+)/i,
     ];
 
     for (const pattern of patterns) {
@@ -357,34 +347,45 @@ export class ConfirmationPage {
     return undefined;
   }
 
-  private async generateTestCodeWithLLM(
-    testPlan: TestPlan,
-    applicationMap: ApplicationMap
-  ): Promise<string | null> {
-    try {
-      const testPlanJson = JSON.stringify(testPlan, null, 2);
-      const appMapJson = JSON.stringify(applicationMap, null, 2);
-
-      const llmResponse = await this.llmService.generatePlaywrightTest(
-        testPlanJson,
-        appMapJson
-      );
-
-      return llmResponse || null;
-    } catch (error) {
-      this.logger.debug('Error generating test with LLM', error);
-      return null;
-    }
+  private injectIntentionalFailure(testCode: string, userStory: string = '', requestedType?: IntentionalFailure['type']): string {
+    const failureTypes = [
+      { type: 'GENERATOR_FAILURE', available: testCode.includes('toBeVisible()'), apply: (source: string) => source.replace("toBeVisible()", "toContainText('intentionally incorrect generated assertion')") },
+      { type: 'INCORRECT_SELECTOR', available: testCode.includes('#login-button') || testCode.includes('[data-test="login-button"]'), apply: (source: string) => source.replace('#login-button', '#wrong-login-button').replace('[data-test="login-button"]', '[data-test="wrong-login-button"]') },
+      { type: 'INCORRECT_ASSERTION', available: testCode.includes('toBeVisible()'), apply: (source: string) => source.replace("toBeVisible()", "toContainText('intentionally incorrect expectation')") },
+      { type: 'MISSING_ACTION', available: testCode.includes(".shopping_cart_link"), apply: (source: string) => source.replace("await page.locator('.shopping_cart_link').click();", "") },
+      { type: 'INCORRECT_NAVIGATION', available: testCode.includes('inventory.html'), apply: (source: string) => source.replace("inventory.html", "missing-state.html") },
+      { type: 'INCORRECT_INTERACTION', available: testCode.includes('[data-test^="add-to-cart"]'), apply: (source: string) => source.replace('[data-test^="add-to-cart"]', '[data-test^="missing-add-to-cart"]') },
+    ].filter((failure) => failure.available);
+    const seed = [...userStory].reduce((value, character) => (value * 31 + character.charCodeAt(0)) >>> 0, 7);
+    const selected = failureTypes.find((failure) => failure.type === requestedType) || failureTypes[seed % failureTypes.length] || { type: 'RUNTIME_ISSUE', apply: (source: string) => `${source}\n  throw new Error('Intentional scenario-relevant runtime failure');` };
+    const mutatedSource = selected.apply(testCode);
+    const originalLines = testCode.split('\n');
+    const mutatedLines = mutatedSource.split('\n');
+    const changedLine = mutatedLines.findIndex((line, index) => line !== originalLines[index]);
+    const lineNumber = changedLine >= 0 ? changedLine + 2 : 2;
+    return `// intentional-failure: ${selected.type}; seed=${seed}; file=repositories/tests/generated-scenarios.spec.ts; line=${lineNumber}\n${mutatedSource}`;
   }
 
-  private injectIntentionalFailure(testCode: string): string {
-    return testCode
-      .replace(/#login-button/g, '#wrong-login-button')
-      .replace(/\[data-test="login-button"\]/g, '[data-test="wrong-login-button"]')
-      .replace(/\[data-test='login-button'\]/g, "[data-test='wrong-login-button']")
-      .replace(/loginButton\.click\(\)/g, "page.locator('#wrong-login-button').click()")
-      .replace(/\['login-button'\]/g, "['wrong-login-button']")
-      .replace(/\.click\(\);\s*await expect\(page\.locator\('\.inventory_list'\)\)/g, ".click();\n    await expect(page.locator('.inventory_list')).toBeVisible();");
+  private applyApplicationMapSelectors(testCode: string, applicationMap: ApplicationMap): string {
+    const selector = (value: unknown, fallback: string): string => {
+      if (typeof value === 'string') return value;
+      if (value && typeof value === 'object' && 'selector' in value && typeof value.selector === 'string') {
+        return value.selector;
+      }
+      return fallback;
+    };
+    const selectorReplacements: Record<string, string> = {
+      '#user-name': selector(applicationMap.elements.username, '#user-name'),
+      '[data-test="username"]': selector(applicationMap.elements.username, '[data-test="username"]'),
+      '#password': selector(applicationMap.elements.password, '#password'),
+      '[data-test="password"]': selector(applicationMap.elements.password, '[data-test="password"]'),
+      '#login-button': selector(applicationMap.elements.loginButton, '#login-button'),
+      '[data-test="login-button"]': selector(applicationMap.elements.loginButton, '[data-test="login-button"]'),
+    };
+    return Object.entries(selectorReplacements).reduce(
+      (source, [expectedSelector, observedSelector]) => source.split(expectedSelector).join(observedSelector),
+      testCode
+    );
   }
 
   private generateDefaultTestCode(
@@ -408,14 +409,19 @@ export class ConfirmationPage {
     const explicitPassword = this.extractPassword(userStory)
       || process.env.DEFAULT_PASSWORD
       || 'secret_sauce';
-    const requiresCheckout = userStoryLower.includes('checkout') || userStoryLower.includes('confirm order');
-    const requiresCart = userStoryLower.includes('cart') || userStoryLower.includes('add to cart') || requiresCheckout;
+    const planActions = (testPlan?.steps || []).map((step) => `${step.action} ${step.description} ${step.expectedResult || ''}`).join(' ').toLowerCase();
+    const requiresCheckout = userStoryLower.includes('checkout') || userStoryLower.includes('confirm order') ||
+      /first\s+name|last\s+name|zip|postal|finish|thank\s+you|order\s+confirmation|checkout/.test(planActions);
+    const productNames = this.extractProductNames(userStory);
+    const verifiesCartBadge = /cart\s+(?:badge|count)|badge\s+(?:shows|is|contains|equals)|cart badge/i.test(userStory);
+    const requiresCartPage = !verifiesCartBadge && (requiresCheckout || /cart page|cart list|open cart|products? (?:appear|are displayed)\s+(?:in|on)\s+(?:the )?cart|cart has updated|same product/i.test(userStory));
+    const requiresCart = !verifiesCartBadge && (requiresCartPage || productNames.length > 0 || /add to cart/i.test(userStory));
 
     if (isNegativeAuthFlow) {
       return `
 import { test, expect } from '@playwright/test';
 
-test('${scenarioName}', async ({ page }) => {
+test(${JSON.stringify(scenarioName)}, async ({ page }) => {
   await page.goto('https://www.saucedemo.com');
   await page.fill('#user-name', '${explicitUsername}');
   await page.fill('#password', '${explicitPassword}');
@@ -432,14 +438,13 @@ test('${scenarioName}', async ({ page }) => {
       return `
 import { test, expect } from '@playwright/test';
 
-test('${scenarioName}', async ({ page }) => {
+test(${JSON.stringify(scenarioName)}, async ({ page }) => {
   await page.goto('https://www.saucedemo.com');
   await page.locator('[data-test="username"]').fill('${explicitUsername}');
   await page.locator('[data-test="password"]').fill('${explicitPassword}');
   await page.locator('[data-test="login-button"]').click();
   await expect(page).toHaveURL(/.*inventory.html/);
-  const addBtn = page.locator('[data-test^="add-to-cart"]').first();
-  await addBtn.click();
+${this.generateProductAddActions(productNames)}
   await page.locator('.shopping_cart_link').click();
   await expect(page).toHaveURL(/.*cart.html/);
   await page.locator('[data-test="checkout"]').click();
@@ -454,21 +459,37 @@ test('${scenarioName}', async ({ page }) => {
 `;
     }
 
-    if (requiresCart) {
+    if (verifiesCartBadge) {
       return `
 import { test, expect } from '@playwright/test';
 
-test('${scenarioName}', async ({ page }) => {
+test(${JSON.stringify(scenarioName)}, async ({ page }) => {
   await page.goto('https://www.saucedemo.com');
   await page.locator('[data-test="username"]').fill('${explicitUsername}');
   await page.locator('[data-test="password"]').fill('${explicitPassword}');
   await page.locator('[data-test="login-button"]').click();
   await expect(page).toHaveURL(/.*inventory.html/);
-  const addBtn = page.locator('[data-test^="add-to-cart"]').first();
-  await addBtn.click();
+${this.generateProductAddActions(productNames)}
+  await expect(page.locator('.shopping_cart_badge')).toHaveText('${productNames.length || 1}');
+});
+`;
+    }
+
+    if (requiresCart) {
+      return `
+import { test, expect } from '@playwright/test';
+
+test(${JSON.stringify(scenarioName)}, async ({ page }) => {
+  await page.goto('https://www.saucedemo.com');
+  await page.locator('[data-test="username"]').fill('${explicitUsername}');
+  await page.locator('[data-test="password"]').fill('${explicitPassword}');
+  await page.locator('[data-test="login-button"]').click();
+  await expect(page).toHaveURL(/.*inventory.html/);
+${this.generateProductAddActions(productNames)}
   await page.locator('.shopping_cart_link').click();
   await expect(page).toHaveURL(/.*cart.html/);
   await expect(page.locator('.cart_list')).toBeVisible();
+${(productNames.length ? productNames : ['Sauce Labs Backpack']).map((productName) => `  await expect(page.locator('.cart_item').filter({ hasText: ${JSON.stringify(productName)} }).first()).toBeVisible();`).join('\n')}
 });
 `;
     }
@@ -485,4 +506,22 @@ test('${scenarioName}', async ({ page }) => {
 });
 `;
   }
+
+  private extractProductNames(userStory: string): string[] {
+    const matches = [...userStory.matchAll(/["']([^"']+)["'](?=\s+products?\b|\s*,|\s+and|\s+to\s+the\s+cart)/gi)]
+      .map((match) => match[1].trim())
+      .filter((name) => /^Sauce Labs\b/i.test(name));
+    return [...new Set(matches)];
+  }
+
+  private generateProductAddActions(productNames: string[]): string {
+    const names = productNames.length ? productNames : [''];
+    return names.map((productName, index) => {
+      const productLocator = productName
+        ? `page.locator('.inventory_item').filter({ hasText: ${JSON.stringify(productName)} }).first()`
+        : `page.locator('.inventory_item').first()`;
+      return `  const product${index + 1} = ${productLocator};\n  await product${index + 1}.locator('[data-test^="add-to-cart"]').click();`;
+    }).join('\n');
+  }
+
 }

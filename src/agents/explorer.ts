@@ -125,8 +125,11 @@ export class ExplorerAgent {
       userStoryLower.includes('error message') ||
       userStoryLower.includes('verify error') ||
       (userStoryLower.includes('login') && userStoryLower.includes('error'));
-    const wantsCart = userStoryLower.includes('cart') || userStoryLower.includes('add to cart');
-    const wantsCheckout = userStoryLower.includes('checkout') || userStoryLower.includes('confirm order');
+    const verifiesCartBadge = /cart\s+(?:badge|count)|badge\s+(?:shows|is|contains|equals)|cart badge/i.test(userStoryLower);
+    const wantsCart = !verifiesCartBadge && (userStoryLower.includes('cart') || userStoryLower.includes('add to cart'));
+    const wantsCheckout = userStoryLower.includes('checkout') ||
+      userStoryLower.includes('confirm order') ||
+      /first\s+name|last\s+name|zip|postal|finish|thank\s+you|order\s+confirmation/.test(userStoryLower);
 
     try {
       this.logger.info(`Navigating to ${appUrl}`);
@@ -139,7 +142,7 @@ export class ExplorerAgent {
         url: appUrl,
         elements: loginPageElements,
       };
-      Object.assign(elements, loginPageElements);
+      Object.assign(elements, this.selectorSummary(loginPageElements));
 
       if (isNegativeAuthFlow) {
         this.logger.info(`Attempting negative login with user: ${username}`);
@@ -149,12 +152,9 @@ export class ExplorerAgent {
 
         await page.waitForSelector('[data-test="error"]', { timeout: 5000 }).catch(() => {});
         const errorElements = await this.discoverLoginPage(page);
-        pages['login-error'] = {
-          name: 'LoginErrorPage',
-          url: appUrl,
-          elements: errorElements,
-        };
-        Object.assign(elements, errorElements);
+        // The error state is part of the Login page, not a separate application page.
+        pages.login.elements = { ...pages.login.elements, ...errorElements };
+        Object.assign(elements, this.selectorSummary(errorElements));
         workflow.push('auth-error');
       } else {
         this.logger.info(`Logging in with user: ${username}`);
@@ -162,21 +162,25 @@ export class ExplorerAgent {
         await page.fill('#password', password);
         await page.click('#login-button');
 
-        const productsVisible = await page.waitForSelector('.product_list', { timeout: 5000 }).catch(() => null);
+        const productsVisible = await page.waitForSelector('.inventory_list', { timeout: 10000 }).catch(() => null);
+
+        if (!productsVisible) {
+          throw new Error('Products page did not load after login: expected .inventory_list');
+        }
 
         if (productsVisible) {
           workflow.push('products');
           const productsPageElements = await this.discoverProductsPage(page);
           pages['products'] = {
             name: 'ProductsPage',
-            url: `${appUrl}inventory.html`,
+            url: `${appUrl.replace(/\/$/, '')}/inventory.html`,
             elements: productsPageElements,
           };
-          Object.assign(elements, productsPageElements);
+          Object.assign(elements, this.selectorSummary(productsPageElements));
         }
 
         if ((wantsCart || wantsCheckout) && !isNegativeAuthFlow) {
-          const addButtons = await page.$$('.btn_primary');
+          const addButtons = await page.$$('[data-test^="add-to-cart"]');
           if (addButtons.length > 0) {
             await addButtons[0].click();
             this.logger.info('Product added to cart');
@@ -189,10 +193,10 @@ export class ExplorerAgent {
           const cartPageElements = await this.discoverCartPage(page);
           pages['cart'] = {
             name: 'CartPage',
-            url: `${appUrl}cart.html`,
+            url: `${appUrl.replace(/\/$/, '')}/cart.html`,
             elements: cartPageElements,
           };
-          Object.assign(elements, cartPageElements);
+          Object.assign(elements, this.selectorSummary(cartPageElements));
 
           if (wantsCheckout) {
             await page.click('.checkout_button');
@@ -204,10 +208,10 @@ export class ExplorerAgent {
             const checkoutPageElements = await this.discoverCheckoutPage(page);
             pages['checkout-info'] = {
               name: 'CheckoutPage',
-              url: `${appUrl}checkout-step-one.html`,
+              url: `${appUrl.replace(/\/$/, '')}/checkout-step-one.html`,
               elements: checkoutPageElements,
             };
-            Object.assign(elements, checkoutPageElements);
+            Object.assign(elements, this.selectorSummary(checkoutPageElements));
 
             await page.fill('[data-test="firstName"]', 'John').catch(() => {});
             await page.fill('[data-test="lastName"]', 'Doe').catch(() => {});
@@ -220,10 +224,10 @@ export class ExplorerAgent {
             const overviewElements = await this.discoverCheckoutOverviewPage(page);
             pages['checkout-overview'] = {
               name: 'CheckoutOverviewPage',
-              url: `${appUrl}checkout-step-two.html`,
+              url: `${appUrl.replace(/\/$/, '')}/checkout-step-two.html`,
               elements: overviewElements,
             };
-            Object.assign(elements, overviewElements);
+            Object.assign(elements, this.selectorSummary(overviewElements));
 
             await page.click('[data-test="finish"]').catch(() => {});
             await page.waitForSelector('.checkout_complete', { timeout: 5000 }).catch(
@@ -234,10 +238,10 @@ export class ExplorerAgent {
             const confirmationElements = await this.discoverConfirmationPage(page);
             pages['checkout-complete'] = {
               name: 'ConfirmationPage',
-              url: `${appUrl}checkout-complete.html`,
+              url: `${appUrl.replace(/\/$/, '')}/checkout-complete.html`,
               elements: confirmationElements,
             };
-            Object.assign(elements, confirmationElements);
+            Object.assign(elements, this.selectorSummary(confirmationElements));
           }
         }
       }
@@ -265,12 +269,12 @@ export class ExplorerAgent {
   } {
     const normalized = userStory.toLowerCase();
     const explicitUsername =
-      userStory.match(/(?:username|user(?:name)?\s*[:=]\s*|login\s+with\s+|with\s+)([A-Za-z0-9_.-]+)/i)?.[1]?.trim() ||
+      userStory.match(/(?:username|user(?:name)?\s*[:=]\s*|login\s+with\s+)([A-Za-z0-9_.-]+)/i)?.[1]?.trim() ||
       userStory.match(/(?:login\s+with\s+|using\s+|with\s+)([A-Za-z0-9_.-]+)(?=\s+(?:using|with|and|for|verify|$))/i)?.[1]?.trim() ||
       undefined;
     const explicitPassword =
       userStory.match(/(?:password\s*(?:is|=|:)?\s*)([A-Za-z0-9_.!@#$%^&*()-+=]+)/i)?.[1]?.trim() ||
-      userStory.match(/(?:using|with)\s+([A-Za-z0-9_.!@#$%^&*()-+=]+)(?=\s+(?:and|for|verify|$))/i)?.[1]?.trim() ||
+      userStory.match(/using\s+([A-Za-z0-9_.!@#$%^&*()-+=]+)(?=\s+(?:and|for|verify|$))/i)?.[1]?.trim() ||
       undefined;
 
     return {
@@ -283,6 +287,12 @@ export class ExplorerAgent {
         normalized.includes('verify error') ||
         (normalized.includes('login') && normalized.includes('error')),
     };
+  }
+
+  private selectorSummary(elements: Record<string, ElementInfo>): Record<string, string> {
+    return Object.fromEntries(
+      Object.entries(elements).map(([name, element]) => [name, element.selector])
+    );
   }
 
   private async discoverLoginPage(page: any): Promise<Record<string, ElementInfo>> {
@@ -338,19 +348,19 @@ export class ExplorerAgent {
     const elements: Record<string, ElementInfo> = {};
 
     try {
-      const productList = await page.$('.product_list');
+      const productList = await page.$('.inventory_list');
       if (productList) {
         elements['productList'] = {
-          selector: '.product_list',
+          selector: '.inventory_list',
           type: 'div',
           label: 'Product List',
         };
       }
 
-      const addToCartButtons = await page.$$('.btn_primary');
+      const addToCartButtons = await page.$$('[data-test^="add-to-cart"]');
       if (addToCartButtons.length > 0) {
         elements['addToCartButton'] = {
-          selector: '.btn_primary',
+          selector: '[data-test^="add-to-cart"]',
           type: 'button',
           label: 'Add to Cart',
           isClickable: true,

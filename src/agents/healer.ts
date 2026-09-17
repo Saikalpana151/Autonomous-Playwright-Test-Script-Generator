@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import { Logger } from '../services/logger';
 import { LLMService } from '../services/llm';
 import { FileSystemService } from '../services/filesystem';
-import { ExecutionResults, ApplicationMap, TestPlan, FailureInfo, FailureType } from '../types';
+import { ExecutionResults, ApplicationMap, TestPlan, FailureInfo, FailureType, HealingRecord, FailureClassification, HealingDiagnostic, RecoveryAgent, IntentionalFailure } from '../types';
 
 export class HealerAgent {
   private logger: Logger;
@@ -22,28 +22,58 @@ export class HealerAgent {
 
   async analyze(
     executionResults: ExecutionResults | null,
-    _applicationMap: ApplicationMap | null,
-    _testPlan: TestPlan | null
-  ): Promise<boolean> {
+    applicationMap: ApplicationMap | null,
+    testPlan: TestPlan | null,
+    generatedTest = '',
+    intentionalFailure?: IntentionalFailure
+  ): Promise<{ applied: boolean; record?: HealingRecord; diagnostic?: HealingDiagnostic }> {
     if (!executionResults || executionResults.passed) {
-      return false;
+      return { applied: false };
     }
 
+    let failureType: FailureType = 'UNKNOWN_FAILURE';
+    let classification: FailureClassification = 'UNKNOWN_INSUFFICIENT_EVIDENCE';
+    let healingStrategy = 'No repair was applied';
+    let diagnostic: HealingDiagnostic | undefined;
     try {
       this.logger.info('\n==================================================');
       this.logger.info('HEALER ANALYZING FAILURE');
       this.logger.info('==================================================');
 
-      const failureType = this.analyzeFailure(executionResults);
+      failureType = this.analyzeFailure(executionResults);
+      classification = this.classifyFailure(failureType);
       const failureLog = executionResults.error || executionResults.logs.join('\n') || 'Unknown Playwright failure';
+      diagnostic = this.buildDiagnostic(failureType, classification, failureLog, applicationMap, testPlan, generatedTest, intentionalFailure);
       this.logger.info(`Root Cause: ${failureType}`);
+
+      if (classification === 'ENVIRONMENT_FAILURE' || classification === 'UNKNOWN_INSUFFICIENT_EVIDENCE') {
+        return {
+          applied: false,
+          record: {
+            attempt: executionResults.retryInfo.attempts,
+            rootCause: failureType,
+            classification,
+            fixApplied: 'No repair: failure requires environment or additional evidence',
+            affectedFile: this.fileSystemService.getGeneratedTestsFile(),
+            affectedTest: executionResults.scenario,
+            timestamp: new Date().toISOString(),
+            fixSucceeded: false,
+            retryResult: 'NOT_RUN',
+            rootCauseExplanation: diagnostic.rootCauseExplanation,
+            suggestedAgents: diagnostic.suggestedAgents,
+            confidenceScore: diagnostic.confidenceScore,
+            evidenceSummary: diagnostic.evidenceSummary,
+          },
+          diagnostic,
+        };
+      }
 
       const llmSummary = await this.llmService.analyzeFailure(
         failureLog,
-        JSON.stringify(_testPlan ?? { scenario: executionResults.scenario }, null, 2)
+        JSON.stringify({ applicationMap, testPlan, generatedTest, executionResults }, null, 2)
       );
 
-      let healingStrategy = 'Repair the generated Playwright test';
+      healingStrategy = 'Repair the generated Playwright test';
       try {
         const payload = JSON.parse(llmSummary.replace(/```json|```/gi, '').trim());
         if (payload.healingStrategy) {
@@ -54,25 +84,62 @@ export class HealerAgent {
       }
 
       const fixed = await this.applyFixToGeneratedTest(failureLog, failureType, healingStrategy);
-      if (!fixed) {
-        return false;
-      }
-
       const failureInfo: FailureInfo = {
-        attempt: executionResults.retryInfo.attempts + 1,
+        attempt: executionResults.retryInfo.attempts,
         rootCause: failureType,
+        classification,
         healingStrategy,
         timestamp: new Date().toISOString(),
       };
 
       executionResults.retryInfo.failures.push(failureInfo);
+      const record: HealingRecord = {
+        attempt: failureInfo.attempt,
+        rootCause: failureType,
+        fixApplied: healingStrategy,
+        affectedFile: this.fileSystemService.getGeneratedTestsFile(),
+        affectedTest: executionResults.scenario,
+        timestamp: new Date().toISOString(),
+        classification,
+        fixSucceeded: fixed,
+        retryResult: fixed ? 'NOT_RUN' : 'NOT_RUN',
+        rootCauseExplanation: diagnostic.rootCauseExplanation,
+        suggestedAgents: diagnostic.suggestedAgents,
+        confidenceScore: diagnostic.confidenceScore,
+        evidenceSummary: diagnostic.evidenceSummary,
+      };
+      if (!fixed) {
+        return { applied: false, record, diagnostic };
+      }
       this.logger.info(`Healing Strategy: ${healingStrategy}`);
       this.logger.info('HEALER FIX APPLIED');
       this.logger.info('==================================================\n');
-      return true;
+      return { applied: true, record, diagnostic };
     } catch (error) {
       this.logger.error('Healer Agent failed', error);
-      return false;
+      const record: HealingRecord = {
+        attempt: executionResults.retryInfo.attempts,
+        rootCause: failureType,
+        classification,
+        fixApplied: healingStrategy,
+        affectedFile: this.fileSystemService.getGeneratedTestsFile(),
+        affectedTest: executionResults.scenario,
+        timestamp: new Date().toISOString(),
+        fixSucceeded: false,
+        retryResult: 'NOT_RUN',
+        rootCauseExplanation: diagnostic?.rootCauseExplanation,
+        suggestedAgents: diagnostic?.suggestedAgents,
+        confidenceScore: diagnostic?.confidenceScore,
+        evidenceSummary: diagnostic?.evidenceSummary,
+      };
+      executionResults.retryInfo.failures.push({
+        attempt: record.attempt,
+        rootCause: record.rootCause,
+        healingStrategy: record.fixApplied,
+        timestamp: record.timestamp,
+      });
+      diagnostic = diagnostic || this.buildDiagnostic(failureType, classification, 'Healer exception', applicationMap, testPlan, generatedTest, intentionalFailure);
+      return { applied: false, record, diagnostic };
     }
   }
 
@@ -96,6 +163,66 @@ export class HealerAgent {
     const cleanedCode = this.fileSystemService.normalizeGeneratedSpec(repairedCode);
     fs.writeFileSync(specPath, cleanedCode);
     return true;
+  }
+
+  classifyExecutionFailure(executionResults: ExecutionResults): FailureClassification {
+    return this.classifyFailure(this.analyzeFailure(executionResults));
+  }
+
+  private buildDiagnostic(
+    failureType: FailureType,
+    classification: FailureClassification,
+    failureLog: string,
+    applicationMap: ApplicationMap | null,
+    testPlan: TestPlan | null,
+    generatedTest: string,
+    intentionalFailure?: IntentionalFailure
+  ): HealingDiagnostic {
+    const selectorEvidence = applicationMap
+      ? Object.values(applicationMap.pages).flatMap((page) => Object.values(page.elements)).filter((element) => Boolean(element.selector)).length
+      : 0;
+    const planEvidence = testPlan?.steps.length || 0;
+    const generatorEvidence = generatedTest.length;
+    const explorerDefect = intentionalFailure?.type === 'EXPLORER_FAILURE' && intentionalFailure.affectedAgent === 'Explorer';
+    const generatorDefect = intentionalFailure?.type === 'GENERATOR_FAILURE' && intentionalFailure.affectedAgent === 'Generator';
+    const suggestedAgents: RecoveryAgent[] = explorerDefect
+      ? ['Explorer', 'Planner', 'Generator', 'Executor']
+      : generatorDefect
+        ? ['Generator', 'Executor']
+      : classification === 'PLAYWRIGHT_RUNTIME_FAILURE'
+      ? ['Healer', 'Executor']
+      : classification === 'GENERATED_TEST_FAILURE'
+        ? ['Planner', 'Generator', 'Executor']
+        : classification === 'ENVIRONMENT_FAILURE'
+          ? ['Executor']
+          : ['Explorer', 'Planner', 'Generator', 'Executor'];
+    const rootCauseExplanation = explorerDefect
+      ? 'Selector mismatch between Explorer evidence and Generator code: the current application map contains an invalid username selector, so Explorer must be rerun before planning and generation.'
+      : generatorDefect
+        ? 'Generated-test defect: the Generator injected an incorrect assertion, so the generated source must be regenerated before Executor retries.'
+      : classification === 'PLAYWRIGHT_RUNTIME_FAILURE'
+      ? 'The execution diagnostics indicate a browser, locator, timeout, or runtime problem after comparing the generated test with observed application evidence.'
+      : classification === 'GENERATED_TEST_FAILURE'
+        ? 'The failure is more consistent with a mismatch between the user story, planner steps, and generated implementation than with browser infrastructure.'
+        : classification === 'ENVIRONMENT_FAILURE'
+          ? 'The diagnostics indicate a network or environment problem, so code repair is not justified.'
+          : 'The available evidence is insufficient to identify a trustworthy single root cause.';
+    return {
+      classification,
+      failureType,
+      rootCause: failureType,
+      rootCauseExplanation,
+      suggestedAgents,
+      confidenceScore: Math.min(0.98, 0.4 + (failureLog ? 0.2 : 0) + (selectorEvidence > 0 ? 0.15 : 0) + (planEvidence > 0 ? 0.15 : 0) + (generatorEvidence > 0 ? 0.1 : 0)),
+      evidenceSummary: `Explorer selectors=${selectorEvidence}; Planner steps=${planEvidence}; Generated source length=${generatorEvidence}; Executor diagnostics=${failureLog.slice(0, 500)}`,
+    };
+  }
+
+  classifyFailure(failureType: FailureType): FailureClassification {
+    if (failureType === 'NETWORK_FAILURE') return 'ENVIRONMENT_FAILURE';
+    if (failureType === 'LOCATOR_FAILURE' || failureType === 'TIMEOUT_FAILURE' || failureType === 'FLAKY_FAILURE') return 'PLAYWRIGHT_RUNTIME_FAILURE';
+    if (failureType === 'ASSERTION_FAILURE' || failureType === 'BUSINESS_LOGIC_FAILURE') return 'GENERATED_TEST_FAILURE';
+    return 'UNKNOWN_INSUFFICIENT_EVIDENCE';
   }
 
   private analyzeFailure(executionResults: ExecutionResults): FailureType {

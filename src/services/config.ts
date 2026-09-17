@@ -12,6 +12,7 @@ export interface Config {
   logLevel: string;
   logDir: string;
   intentionalFailure: boolean;
+  intentionalFailureSeed: string;
 }
 
 export class ConfigService {
@@ -32,6 +33,7 @@ export class ConfigService {
       logDir: process.env.LOG_DIR || 'logs',
       intentionalFailure:
         (process.env.INTENTIONAL_TEST_FAILURE || 'false').toLowerCase() === 'true',
+      intentionalFailureSeed: process.env.INTENTIONAL_FAILURE_SEED || '',
     };
   }
 

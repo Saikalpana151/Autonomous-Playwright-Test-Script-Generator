@@ -36,6 +36,7 @@ export class ReportAgent {
 
       const finalReport: FinalReport = {
         timestamp: new Date().toISOString(),
+        runId: context.runId,
         systemConnectivity: {
           llmStatus,
         },
@@ -47,7 +48,7 @@ export class ReportAgent {
         actualWorkflow: context.applicationMap?.workflow || [],
         plannerStatus: context.testPlan ? 'Completed' : 'Not Required',
         excelStatus: scenarioReused ? 'Reused from Excel' : 'Added to Excel',
-        generatedFiles: this.getGeneratedFiles(),
+        generatedFiles: this.getGeneratedFiles(context),
         explorerDetails: this.buildExplorerDetails(context),
         generatorDetails: this.buildGeneratorDetails(context, scenarioReused),
         executorDetails: this.buildExecutorDetails(context),
@@ -55,6 +56,8 @@ export class ReportAgent {
         testResults: this.buildTestResults(context),
         retrySummary: this.buildRetrySummary(context),
         finalOutcome: context.executionResults?.passed ? 'SUCCESS' : 'FAILED',
+        intentionalFailure: context.healerInvoked ? context.intentionalFailure : undefined,
+        recoveryHistory: context.recoveryHistory,
       };
 
       // Display report
@@ -73,16 +76,14 @@ export class ReportAgent {
     }
   }
 
-  private getGeneratedFiles(): string[] {
-    const files = [
-      'repositories/application-maps/*.json',
-      'repositories/tests/generated-scenarios.spec.ts',
-      'repositories/tests/page-objects/*.ts',
+  private getGeneratedFiles(context: ExecutionContext): string[] {
+    return [
+      context.applicationMap ? `repositories/application-maps/${context.applicationMap.name}.json` : '',
+      context.generatedTestPath,
+      ...context.generatedPageObjects.map((file) => `repositories/tests/page-objects/${file}`),
       'test-artifacts/execution-report.json',
       'test-plans.xlsx',
-    ];
-
-    return files;
+    ].filter(Boolean);
   }
 
   private buildExplorerDetails(context: ExecutionContext): ExplorerDetails {
@@ -142,12 +143,10 @@ export class ReportAgent {
       triggered,
       rootCause: lastFailure?.rootCause,
       fixStrategy: lastFailure?.healingStrategy,
-      agentsInvoked: triggered ? ['Healer', 'Executor'] : [],
-      iterations: context.retryCount,
-      filesUpdated: [
-        'repositories/tests/page-objects/*.ts',
-        'repositories/tests/generated-scenarios.spec.ts',
-      ],
+      agentsInvoked: [...new Set(context.recoveryHistory.map((record) => record.agent))],
+      iterations: context.healerInvocationCount,
+      filesUpdated: context.healingRecords.map((record) => record.affectedFile),
+      healingAttempts: context.healingRecords,
     };
   }
 
@@ -163,20 +162,13 @@ export class ReportAgent {
   }
 
   private buildRetrySummary(context: ExecutionContext): RetrySummary {
-    const failures = context.executionResults?.retryInfo.failures || [];
-
+    const outcomes = context.executionOutcomes;
     const summary: RetrySummary = {
-      attempt1: failures.length > 0 ? 'failed' : 'passed',
+      attempt1: outcomes[0] ? 'passed' : 'failed',
     };
-
-    if (failures.length > 0 && context.retryCount > 1) {
-      summary.attempt2 = failures.length > 1 ? 'failed' : 'passed';
-    }
-
-    if (failures.length > 1 && context.retryCount > 2) {
-      summary.attempt3 = failures.length > 2 ? 'failed' : 'passed';
-    }
-
+    if (outcomes.length > 1) summary.attempt2 = outcomes[1] ? 'passed' : 'failed';
+    if (outcomes.length > 2) summary.attempt3 = outcomes[2] ? 'passed' : 'failed';
+    if (outcomes.length > 3) summary.attempt4 = outcomes[3] ? 'passed' : 'failed';
     return summary;
   }
 

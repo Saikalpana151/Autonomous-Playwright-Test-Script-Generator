@@ -16,13 +16,40 @@ export class FileSystemService {
   }
 
   private ensureDirectories(): void {
-    const dirs = [this.appMapDir, this.testDir, this.artifactDir];
+    const dirs = [this.appMapDir, this.testDir, path.join(this.testDir, 'page-objects'), this.artifactDir];
     dirs.forEach((dir) => {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
         this.logger.debug(`Created directory: ${dir}`);
       }
     });
+  }
+
+  clearRunArtifacts(): void {
+    const generatedTest = this.getGeneratedTestsFile();
+    fs.writeFileSync(generatedTest, '');
+
+    if (fs.existsSync(this.artifactDir)) {
+      for (const entry of fs.readdirSync(this.artifactDir)) {
+        fs.rmSync(path.join(this.artifactDir, entry), { force: true, recursive: true });
+      }
+    }
+    this.logger.info('Cleared generated artifacts for the new workflow run');
+  }
+
+  clearGeneratedPageObjects(): void {
+    const directory = path.join(this.testDir, 'page-objects');
+    if (!fs.existsSync(directory)) return;
+    for (const entry of fs.readdirSync(directory)) {
+      fs.rmSync(path.join(directory, entry), { force: true });
+    }
+  }
+
+  getPageObjectNames(): string[] {
+    const dir = path.join(this.testDir, 'page-objects');
+    return fs.existsSync(dir)
+      ? fs.readdirSync(dir).filter((file) => file.endsWith('.ts')).sort()
+      : [];
   }
 
   // Application Map methods

@@ -6,6 +6,7 @@ export interface ResolvedCredentials {
 }
 
 export interface ExecutionContext {
+  runId: string;
   userStory: string;
   scenario: string;
   applicationMap: ApplicationMap | null;
@@ -14,10 +15,20 @@ export interface ExecutionContext {
   executionResults: ExecutionResults | null;
   retryCount: number;
   maxRetries: number;
+  maxHealerAttempts: number;
+  healerInvocationCount: number;
+  executionOutcomes: boolean[];
   startTime: Date;
   endTime?: Date;
   healerInvoked?: boolean;
+  agentInvocations: Record<string, number>;
+  healingRecords: HealingRecord[];
+  generatedPageObjects: string[];
+  generatedTestPath: string;
   resolvedCredentials: ResolvedCredentials;
+  intentionalFailure?: IntentionalFailure;
+  evidenceChain?: EvidenceChainEntry[];
+  recoveryHistory: RecoveryRecord[];
 }
 
 export interface ApplicationMap {
@@ -90,8 +101,37 @@ export interface RetryInfo {
 export interface FailureInfo {
   attempt: number;
   rootCause: FailureType;
+  classification?: FailureClassification;
   healingStrategy?: string;
   timestamp: string;
+}
+
+export interface HealingRecord {
+  attempt: number;
+  rootCause: FailureType;
+  fixApplied: string;
+  affectedFile: string;
+  affectedTest: string;
+  timestamp: string;
+  classification?: FailureClassification;
+  fixSucceeded?: boolean;
+  retryResult?: 'PASSED' | 'FAILED' | 'NOT_RUN';
+  rootCauseExplanation?: string;
+  suggestedAgents?: RecoveryAgent[];
+  confidenceScore?: number;
+  evidenceSummary?: string;
+}
+
+export type RecoveryAgent = 'Explorer' | 'Planner' | 'Generator' | 'Executor' | 'Healer';
+
+export interface HealingDiagnostic {
+  classification: FailureClassification;
+  failureType: FailureType;
+  rootCause: string;
+  rootCauseExplanation: string;
+  suggestedAgents: RecoveryAgent[];
+  confidenceScore: number;
+  evidenceSummary: string;
 }
 
 export type FailureType =
@@ -102,6 +142,47 @@ export type FailureType =
   | 'NETWORK_FAILURE'
   | 'FLAKY_FAILURE'
   | 'UNKNOWN_FAILURE';
+
+export type FailureClassification =
+  | 'TEST_PLAN_FAILURE'
+  | 'GENERATED_TEST_FAILURE'
+  | 'PLAYWRIGHT_RUNTIME_FAILURE'
+  | 'ENVIRONMENT_FAILURE'
+  | 'UNKNOWN_INSUFFICIENT_EVIDENCE';
+
+export interface IntentionalFailure {
+  enabled: boolean;
+  type?: 'EXPLORER_FAILURE' | 'PLANNER_FAILURE' | 'GENERATOR_FAILURE' | 'EXECUTOR_FAILURE' | 'INCORRECT_SELECTOR' | 'INCORRECT_ASSERTION' | 'MISSING_ACTION' | 'INCORRECT_NAVIGATION' | 'INCORRECT_TEST_DATA' | 'INCORRECT_INTERACTION' | 'RUNTIME_ISSUE' | 'OTHER';
+  affectedAgent?: 'Explorer' | 'Planner' | 'Generator' | 'Executor' | 'Healer';
+  injectedDefect?: string;
+  reason?: string;
+  recoveryRoute?: string[];
+  target?: string;
+  seed?: number;
+  recordedAt?: string;
+  injectedAtStage?: string;
+  injectedFile?: string;
+  injectedLine?: number;
+}
+
+export interface RecoveryRecord {
+  stage: string;
+  agent: string;
+  action: 'INJECTED' | 'RECOVERY' | 'SKIPPED' | 'COMPLETED';
+  route: string[];
+  reason: string;
+  timestamp: string;
+}
+
+export interface EvidenceChainEntry {
+  requirement: string;
+  plannerStep?: string;
+  explorerEvidence?: string;
+  generatedImplementation?: string;
+  executionEvidence?: string;
+  result: EvaluationResultStatus;
+  justification: string;
+}
 
 export interface LLMConnectionStatus {
   connected: boolean;
@@ -135,6 +216,58 @@ export interface FinalReport {
   testResults: TestResultsSummary;
   retrySummary: RetrySummary;
   finalOutcome: 'SUCCESS' | 'FAILED';
+  runId?: string;
+  intentionalFailure?: IntentionalFailure;
+  recoveryHistory?: RecoveryRecord[];
+  evaluation?: EvaluationResult;
+}
+
+export type EvaluationResultStatus = 'PASS' | 'FAIL' | 'PARTIAL' | 'NOT_EVALUABLE';
+
+export interface EvaluationCriterion {
+  criterion: string;
+  category?: string;
+  weight?: number;
+  expected: string;
+  actual: string;
+  whatWasEvaluated?: string;
+  objective?: string;
+  semanticMapping?: string;
+  evidence: string;
+  result: EvaluationResultStatus;
+  reason: string;
+  justification?: string;
+  gaps?: string;
+  impact?: string;
+  confidence?: 'LOW' | 'MEDIUM' | 'HIGH';
+  defectAttribution?: string;
+  recommendation?: string;
+  scoreContribution?: number;
+  scoreCalculation?: string;
+  sourceOfTruth?: string;
+  crossStageConsistency?: string;
+  severity: 'LOW' | 'MEDIUM' | 'HIGH';
+}
+
+export interface EvaluationCategory {
+  score: number;
+  weight?: number;
+  criteria: EvaluationCriterion[];
+  explanation: string;
+  evidence: string[];
+}
+
+export interface EvaluationResult {
+  explorerAccuracy: EvaluationCategory;
+  testPlanAccuracy: EvaluationCategory;
+  generatedTestAccuracy: EvaluationCategory;
+  executionAccuracy: EvaluationCategory;
+  reportAccuracy: EvaluationCategory;
+  overallScore: number;
+  findings: EvaluationCriterion[];
+  evidence: Record<string, string>;
+  semanticJudgments: Record<string, EvaluationCriterion[]>;
+  generatedAt: string;
 }
 
 export interface SystemConnectivity {
@@ -172,6 +305,7 @@ export interface HealerDetails {
   agentsInvoked: string[];
   iterations: number;
   filesUpdated: string[];
+  healingAttempts: HealingRecord[];
 }
 
 export interface TestResultsSummary {
@@ -185,6 +319,7 @@ export interface RetrySummary {
   attempt1: 'passed' | 'failed';
   attempt2?: 'passed' | 'failed';
   attempt3?: 'passed' | 'failed';
+  attempt4?: 'passed' | 'failed';
 }
 
 export interface ExcelRow {

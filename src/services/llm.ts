@@ -100,6 +100,21 @@ Respond in JSON format with fields: scenario, keySteps, expectedOutcomes, prereq
     }
   }
 
+  async evaluateWorkflow(userStory: string, evidence: string): Promise<string> {
+    const model = this.getModel(
+      'You are a strict QA evaluator. Evaluate explicit criteria using only the supplied evidence. Return JSON only. Never invent execution facts or percentages.'
+    );
+    const prompt = `Evaluate this user story and workflow evidence against these criteria: explorer relevance, complete workflow path, test-plan coverage, generated-test coverage, selector consistency, execution scope, retry/healer consistency, and report consistency.
+
+User Story: ${userStory}
+Evidence:
+${evidence}
+
+Return JSON: {"findings":[{"criterion":"...","result":"PASS|PARTIAL|FAIL|NOT_EVALUABLE","expected":"...","actual":"...","evidence":"...","reason":"...","severity":"LOW|MEDIUM|HIGH"}]}`;
+    const result = await model.generateContent(prompt);
+    return result.response.text();
+  }
+
   async generateTestPlan(
     userStory: string,
     applicationMap: string

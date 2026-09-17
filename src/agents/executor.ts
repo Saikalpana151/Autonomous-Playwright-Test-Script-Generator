@@ -53,7 +53,15 @@ export class ExecutorAgent {
       const resolvedSpecPath = path.resolve(process.cwd(), generatedSpecPath);
       const normalizedSpecPath = resolvedSpecPath.replace(/\\/g, '/');
       const command = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-      const args = ['playwright', 'test', normalizedSpecPath, '--reporter=line'];
+      const scenarioPattern = scenario.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const args = [
+        'playwright',
+        'test',
+        normalizedSpecPath,
+        '--grep',
+        scenarioPattern,
+        '--reporter=line',
+      ];
 
       const execution = spawnSync(command, args, {
         cwd: process.cwd(),

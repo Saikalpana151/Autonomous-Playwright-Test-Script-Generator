@@ -12,6 +12,7 @@ import { GeneratorAgent } from './agents/generator';
 import { ExecutorAgent } from './agents/executor';
 import { HealerAgent } from './agents/healer';
 import { ReportAgent } from './agents/report';
+import { EvaluationAgent } from './agents/evaluator';
 
 async function main(): Promise<void> {
   let logger: Logger | null = null;
@@ -64,6 +65,7 @@ async function main(): Promise<void> {
     const healerAgent = new HealerAgent(logger, llmService, fileSystemService);
 
     const reportAgent = new ReportAgent(logger, fileSystemService);
+    const evaluationAgent = new EvaluationAgent(logger, llmService, fileSystemService);
 
     const orchestratorAgent = new OrchestratorAgent(
       logger,
@@ -77,6 +79,7 @@ async function main(): Promise<void> {
       executorAgent,
       healerAgent,
       reportAgent
+      , evaluationAgent
     );
 
     logger.info('✓ All AI agents initialized\n');
